@@ -11,3 +11,4 @@ only uses printable ASCII characters as instructions, just for fun. It might be
 possible depending on the choice of instructions to make a VM could in
 principle be implemented in hardware on an FPGA.
 
+
