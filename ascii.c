@@ -3,6 +3,11 @@
 #define ACPU_LICENSE "The Unlicense / Public Domain"
 #define ACPU_REPO "https://github.com/howerj/ascii"
 #define ACPU_PROJECT "A VM with an ASCII based instruction set"
+/* This project could be turned into a library (perhaps
+ * header-only), for little gain. Many things would need
+ * to be renamed, especially the single or double letter
+ * functions and types, which would mean the program would lose
+ * some of its charm. */
 
 #include <assert.h>
 #include <errno.h>
@@ -39,7 +44,6 @@ typedef int16_t sw;
 #define BHSIZE (sizeof(b))
 #endif
 
-
 struct acpu;
 typedef struct acpu acpu_t;
 
@@ -61,10 +65,23 @@ struct acpu {
 	b *defs;
 	FILE *prog;
 	io_t io;
-	int error;
+	int error, initialized;
 	int (*user)(acpu_t *a, void *user_param);
 	void *user_param;
 };
+
+enum {
+	E_NONE    =  0,
+	E_GENERAL = -1,
+	E_INIT    = -2,
+	E_BOUND   = -3,
+	E_IO      = -4,
+	E_CALL    = -5,
+	E_DIV0    = -6,
+	E_SYNTAX  = -7,
+};
+
+static inline w B(w x) { return x % ACPU_LENGTH; }
 
 static int buffer_get(void *in) {
 	buffer_t *b = in;
@@ -179,7 +196,7 @@ static void storeb(acpu_t *a, b *m, w v) {
 static int stk(acpu_t *a, long sp, long start, long end) {
 	assert(a);
 	if (!within(sp, start, end)) {
-		a->error = 1;
+		a->error = E_BOUND;
 		return -1;
 	}
 	return 0;
@@ -230,34 +247,42 @@ static int put(acpu_t *a, int ch) {
 	assert(a);
 	assert(a->io.out);
 	if (io_put(ch & 255, &a->io) < 0) {
-		a->error = 1;
+		a->error = E_IO;
 		return -1;
 	}
+	return 0;
+}
+
+static int init(acpu_t *a) {
+	assert(a);
+	if (a->initialized)
+		return 0;
+	if (!a->defs)
+		a->defs = &a->m[DEFS];
+	if (!a->sp)
+		a->sp = VSTART;
+	if (!a->rp)
+		a->rp = RSTART;
+	/*memset(a->m, ' ', ACPU_LENGTH - DEFS);
+	memset(&a->m[DEFS], '0', ACPU_LENGTH - DEFS);*/
+	a->initialized = 1;
 	return 0;
 }
 
 /* TODO: Make short program to assembly, hexdump, disassembly to memory as a
  * simple bootloader.
  * TODO: Documentation
- * TODO: Unit Tests, Test suite of programs, make a Forth interpreter...
- * TODO: Turn into library (header only?)
- * TODO: Optional: commands, load/store ASCII HEX, ...
- * TODO: Replace more complex instructions with code?
- * TODO: Bounds checking
- * TODO: Error codes (set a->error to Error code) */
+ * TODO: Test suite of programs, make a Forth interpreter...
+ * TODO: Bounds checking */
 static int acpu(acpu_t *a) {
 	assert(a);
 	w pc = a->pc, tos = a->tos;
 	b *m = a->m;
-	if (!a->defs)
-		a->defs = &m[DEFS];
-	if (!a->sp)
-		a->sp = VSTART;
-	if (!a->rp)
-		a->rp = RSTART;
+	if (init(a) < 0)
+		return -1;
 	assert((a->defs) >= m && (a->defs <= (m + ACPU_LENGTH)));
 	for (;!(a->error);) { /* N.B. Some commands do not work when reading from `a->prog` */
-		const int ch = a->prog ? fgetc(a->prog) : m[pc++];
+		const int ch = a->prog ? fgetc(a->prog) : m[B(pc++)];
 		if (ch < 0)
 			break;
 		switch (ch) {
@@ -269,13 +294,6 @@ static int acpu(acpu_t *a) {
 			tos <<= 4;
 			tos |= from(ch);
 			break;
-		case '.':
-			put(a, to((tos >> 12) & 15));
-			put(a, to((tos >>  8) & 15));
-			put(a, to((tos >>  4) & 15));
-			put(a, to((tos >>  0) & 15));
-			tos = pop(a);
-			break;
 
 		case '<': tos = -!!((sw)tos < (sw)pop(a)); break;
 		case '>': tos = -!!((sw)tos > (sw)pop(a)); break;
@@ -286,7 +304,7 @@ static int acpu(acpu_t *a) {
 		case '^': tos = tos ^ pop(a); break;
 		case '&': tos = tos & pop(a); break;
 		case '|': tos = tos | pop(a); break;
-		case '/': { w r = tos ? tos : 1, t = pop(a); tos = t / r; push(a, t % r); } break;
+		case '/': { a->error = tos ? a->error: E_DIV0; w r = tos ? tos : 1, t = pop(a); tos = t / r; push(a, t % r); } break;
 		case '*': tos = tos * pop(a); break;
 		case '+': tos = tos + pop(a); break;
 		case '-': tos = pop(a) - tos; break;
@@ -295,11 +313,13 @@ static int acpu(acpu_t *a) {
 		case '~': tos = ~tos; break;
 		case '_': tos = -tos; break;
 
-		case '@': tos = loadw(a, &m[tos]); break;
-		case '!': storew(a, &m[tos], pop(a)); tos = pop(a); break;
-		case 'K': tos = a->m[tos]; break;
-		case 'k': a->m[tos] = pop(a); break;
-		case '`': push(a, tos); tos = m[pc++]; break;
+		case '@': tos = loadw(a, &m[B(tos)]); break;
+		case '!': storew(a, &m[B(tos)], pop(a)); tos = pop(a); break;
+		case 'K': tos = a->m[B(tos)]; break;
+		case 'k': a->m[B(tos)] = pop(a); break;
+		case '`': push(a, tos); tos = m[B(pc++)]; break;
+		case 'y': tos = loadb(a, &m[tos]); break;
+		case 'Y': storeb(a, &m[B(tos)], pop(a)); tos = pop(a); break;
 
 		case 's': push(a, tos); break; /* dup */
 		case 'S': tos = pop(a); break; /* drop */
@@ -312,44 +332,61 @@ static int acpu(acpu_t *a) {
 		case 'P': a->rp = tos; tos = pop(a); break;
 		case 'a': push(a, tos); tos = rpeek(a); break;
 
-		case 'g': rpush(a, pc + WHSIZE); pc = loadw(a, &m[pc]); break;
+		/* An `if...else...` construction would be helpful, as would
+		 * a loop that executed for `x` cycles. */
+		case 'g': rpush(a, pc + WHSIZE); pc = loadw(a, &m[B(pc)]); break;
 		case 'G': rpush(a, pc); pc = tos; tos = pop(a); break; /* call */
 		case 'x': pc = rpop(a); break; /* return */
-		case 'j': pc = loadw(a, &m[pc]); break; /* jump */
+		case 'j': pc = loadw(a, &m[B(pc)]); break; /* jump */
 		case 'J': pc = tos; tos = pop(a); break; /* jump */
-		case 'z': if (!tos) { pc = loadw(a, &m[pc]); } else { pc += WHSIZE; } break; /* jump on zero */
-		case 'Z': if (tos) { pc = loadw(a, &m[pc]); } else { pc += WHSIZE; } break; /* jump on non-zero */
-		case ':':
-			storew(a, a->defs + (m[pc] * WHSIZE), pc + 1);
-			for (pc += 1;;pc++)
-				if (m[pc] == ';' || m[pc] == ':')
-					break;
-			if (m[pc] != ';')
-				a->error = -1;
-			pc++;
-			break; 
+		case 'z': if (!tos) { pc = loadw(a, &m[B(pc)]); } else { pc += WHSIZE; } break; /* jump on zero */
+		case 'Z': if (tos) { pc = loadw(a, &m[B(pc)]); } else { pc += WHSIZE; } break; /* jump on non-zero */
+
 		case ';': pc = rpop(a); break; /* end define */
-		case '%': rpush(a, pc + 1); pc = loadw(a, a->defs + (m[pc] * WHSIZE)); break; /* call definition */
-		case '?': 
-			  if (!a->user) { a->error = 1; break; }
-			  a->pc = pc;
-			  a->tos = tos;
-			  if (a->user(a, a->user_param) < 0) { a->error = 1; break; }
-			  tos = a->tos;
-			  pc = a->pc;
-			  break; /* call user defined extension function */
+		case '%': rpush(a, pc + 1); pc = loadw(a, a->defs + (m[B(pc)] * WHSIZE)); break; /* call definition */
+		case '\'': push(a, tos); tos = loadw(a, a->defs + (m[B(pc)] * WHSIZE)); pc++; break;
+
 		case '(': rpush(a, pc); break; /* unconditional jump; push return loc */
 		case ')': pc = rpeek(a); break;
 		case '{': rpush(a, pc); break; /* conditional jump; push return loc, check tos */
 		case '}': if (tos) { pc = rpeek(a); } else { (void)rpop(a); } tos = pop(a); break;
- 
+
 		case 'I': push(a, tos); tos = a->io.get ? io_get(&a->io) : -1; break; /* input */
 		case 'O': tos = a->io.put ? io_put(tos & 255, &a->io) : -1; break; /* output */
-
 		case '\0': case 'q': goto halt;
 		default: /* nop */ break;
-		}
 
+		/* Complex commands; (more) difficult to implement in hardware, 
+		 * these could be made to be optional. Another possibility would 
+		 * be to replace these commands with code instead.
+		 *
+		 * A way of querying the system for its properties would be
+		 * nice as well.  */
+		case '.':
+			put(a, to((tos >> 12) & 15));
+			put(a, to((tos >>  8) & 15));
+			put(a, to((tos >>  4) & 15));
+			put(a, to((tos >>  0) & 15));
+			tos = pop(a);
+			break;
+		case ':':
+			storew(a, a->defs + (m[B(pc)] * WHSIZE), pc + 1);
+			for (pc += 1;;pc++)
+				if (m[B(pc)] == ';' || m[B(pc)] == ':')
+					break;
+			if (m[pc] != ';')
+				a->error = E_SYNTAX;
+			pc++;
+			break; 
+		case '?': 
+			  if (!a->user) { a->error = E_CALL; break; }
+			  a->pc = pc;
+			  a->tos = tos;
+			  if (a->user(a, a->user_param) < 0) { a->error = E_CALL; break; }
+			  tos = a->tos;
+			  pc = a->pc;
+			  break; /* call user defined extension function */
+		}
 	}
 halt:
 	a->pc = pc;
@@ -375,9 +412,7 @@ static int eval(const char *prog, const char *in, size_t inlen, char *out, size_
 	return r;
 }
 
-static int test(FILE *in, FILE *out) {
-	assert(in);
-	assert(out);
+static int acpu_tests(void) {
 	if (!ACPU_UNIT_TESTS)
 		return 0;
 	/* This code is compiled out if ACPU_UNIT_TESTS == 0 */
@@ -388,8 +423,32 @@ static int test(FILE *in, FILE *out) {
 		const char *input;
 	} test_t;
 
+	/* TODO: Test all these:
+	'6', '7', '8', '9', 
+	'E', '<', '>', 'u', 'U', '^',
+	'/', '*', '-', 'l', 'L', '~', '@', '!',
+	'K', 'k', '`', 'y', 'Y', 's', 'S', 'd', 'r', 'R', 'v', 'V',
+	'p', 'P', 'a', 'g', 'G', 'x', 'j', 'J', 'z', 'Z', ';', '%',
+	'\'', '(', ')', '{', '}', */
 	test_t tests[] = {
+		{ 0, "", "", "", },
+		{ 0, "$1", "", "", },
+		{ 0, "$12345", "", "", },
 		{ 0, "$1$2+.", "0003", "", },
+		{ 0, "$1$2=.", "0000", "", },
+		{ 0, "$1$2|.", "0003", "", },
+		{ 0, "$1$2#.", "FFFF", "", },
+		{ 0, "$1$2#_.", "0001", "", },
+		{ 0, "$ABCD$0000&.", "0000", "", },
+		{ 0, "$FFFF$F05A&.", "F05A", "", },
+		{ 0, "$FFFF$F05A^.", "0FA5", "", },
+		{ -1, ".", "0000", "", },
+		{ 0, "$5{s.$1-s}", "00050004000300020001", "", },
+		{ -1, "{}", "", "", },
+		{ 0, "IO", "X", "X", },
+		{ 0, "IOIO", "XY", "XY", },
+		{ 0, "IOqIO", "X", "XY", },
+		{ 0, "IOIOIIOSO", "ABDC", "ABCDEF", },
 	};
 
 	for (size_t i = 0; i < NELEMS(tests); i++) {
@@ -413,13 +472,14 @@ static int help(FILE *out, const char *arg0) {
 	assert(out);
 	assert(arg0);
 	const char *fmt ="\
-Usage: %s [file|string|f|s] input \n\n\
+Usage: %s [file|string|tests|f|s|t] input \n\n\
 Project: " ACPU_PROJECT "\n\
 Author:  " ACPU_AUTHOR "\n\
 License: " ACPU_LICENSE "\n\
 Email:   " ACPU_EMAIL "\n\
 Repo:    " ACPU_REPO "\n\n\
-This program returns non-zero on error.\n\n";
+This program returns non-zero on error. Built in self tests\n\
+are run at startup. For a more detailed help - use the source.\n\n";
 	return fprintf(out, fmt, arg0);
 }
 
@@ -427,14 +487,12 @@ int main(int argc, char **argv) {
 	static acpu_t a = { .pc = 0, };
 	a.io = (io_t){ .in = stdin, .out = stdout, .put = file_put, .get = file_get, };
 	/*a.prog = stdin;*/
-	if (test(stdin, stdout) < 0)
-		return 1;
-	if (argc < 3) {
+	if (argc < 2) {
 		(void)help(stderr, argv[0]);
 		return 1;
 	}
 	const char *select = argv[1], *input = argv[2];
-	if (!strcmp(select, "file") || !strcmp(select, "f")) {
+	if (argc > 2 && (!strcmp(select, "file") || !strcmp(select, "f"))) {
 		FILE *in = fopen(input, "rb");
 		if (!in) {
 			(void)fprintf(stderr, "Unable to open file `%s` for reading: %s\n", input, strerror(errno));
@@ -443,10 +501,12 @@ int main(int argc, char **argv) {
 		if (fread(a.m, 1, PROGEND, in)) { /* nothing */ }
 		if (fclose(in) < 0)
 			return 1;
-	} else if (!strcmp(select, "string") || !strcmp(select, "s")) {
+	} else if (argc > 2 && (!strcmp(select, "string") || !strcmp(select, "s"))) {
 		size_t l = strlen(input);
 		l = l > PROGEND ? PROGEND : l;
 		memcpy(a.m, input, l);
+	} else if (!strcmp(select, "test") || !strcmp(select, "tests") || !strcmp(select, "t")) {
+		return acpu_tests() < 0;
 	} else {
 		(void)help(stderr, argv[0]);
 		return 1;
