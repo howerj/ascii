@@ -26,3 +26,11 @@ Ideally we would make some test programs (such as a monitor, program
 loader, Forth interpreter, hexdump utility, etcetera) for the CPU to
 tests its functionality.
 
+Jump locations can be stored on the return stack by the VM, however
+forward references have to be manually dealt with (and as all programs
+are in ASCII all characters need to be accounted for).
+
+As mentioned, this is not a serious project, there are much better
+languages out there that could be implemented in roughly the same
+amount of code (e.g. Lisp, Forth, an APL like language, prolog, TCL
+to name a few) with many examples being scattered across the internet.

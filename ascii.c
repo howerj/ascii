@@ -13,6 +13,7 @@
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 typedef uint8_t b;
@@ -63,7 +64,7 @@ struct acpu {
 	b m[ACPU_LENGTH];
 	w pc, tos, sp, rp;
 	b *defs;
-	FILE *prog;
+	FILE *prog, *debug;
 	io_t io;
 	int error, initialized;
 	int (*user)(acpu_t *a, void *user_param);
@@ -130,7 +131,7 @@ static int io_put(const int ch, io_t *io) {
 static uint8_t to(uint8_t v) { assert(v <= 15); return "0123456789ABCDEF"[v & 15]; }
 
 static uint8_t from(uint8_t ch) { 
-	assert((ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 70));
+	assert((ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 70)); /* could set error in acpu_t instead */
 	return ch <= 57 ? ch - 48 : ch - 55 ; 
 }
 
@@ -144,14 +145,14 @@ static w loadw(acpu_t *a, b *m) {
 	assert((m >= a->m) && m <= (a->m + ACPU_LENGTH - WHSIZE));
 	if (!ACPU_ASCII_STORAGE) {
 		w r = 0;
-		r = ((w)m[0]) << 0 | ((w)m[1] << 8);
+		r = ((w)m[1]) << 0 | ((w)m[0] << 8);
 		return r;
 	}
 	w r = 0;
-	r = r | ((w)from(m[0]) <<  0);
-	r = r | ((w)from(m[1]) <<  4);
-	r = r | ((w)from(m[2]) <<  8);
-	r = r | ((w)from(m[3]) << 12);
+	r = r | ((w)from(m[3]) <<  0); /* could make endianess compile time option */
+	r = r | ((w)from(m[2]) <<  4);
+	r = r | ((w)from(m[1]) <<  8);
+	r = r | ((w)from(m[0]) << 12);
 	return r;
 }
 
@@ -160,14 +161,14 @@ static void storew(acpu_t *a, b *m, w v) {
 	assert(m);
 	assert((m >= a->m) && m <= (a->m + ACPU_LENGTH - WHSIZE));
 	if (!ACPU_ASCII_STORAGE) {
-		m[0] = v;
-		m[1] = v >> 8;
+		m[1] = v;
+		m[0] = v >> 8;
 		return;
 	}
-	m[0] = to((v >>  0) & 15);
-	m[1] = to((v >>  4) & 15);
-	m[2] = to((v >>  8) & 15);
-	m[3] = to((v >> 12) & 15);
+	m[3] = to((v >>  0) & 15);
+	m[2] = to((v >>  4) & 15);
+	m[1] = to((v >>  8) & 15);
+	m[0] = to((v >> 12) & 15);
 }
 
 static b loadb(acpu_t *a, b *m) {
@@ -177,8 +178,8 @@ static b loadb(acpu_t *a, b *m) {
 		return m[0];
 	}
 	b r = 0;
-	r = r | (from(m[0]) << 0);
-	r = r | (from(m[1]) << 4);
+	r = r | (from(m[1]) << 0);
+	r = r | (from(m[0]) << 4);
 	return r;
 }
 
@@ -189,8 +190,8 @@ static void storeb(acpu_t *a, b *m, w v) {
 		m[0] = v;
 		return;
 	}
-	m[0] = to((v >> 0) & 15);
-	m[1] = to((v >> 4) & 15);
+	m[1] = to((v >> 0) & 15);
+	m[0] = to((v >> 4) & 15);
 }
 
 static int stk(acpu_t *a, long sp, long start, long end) {
@@ -253,6 +254,10 @@ static int put(acpu_t *a, int ch) {
 	return 0;
 }
 
+static int graphic(int ch) {
+	return ch > 32 && ch < 127 ? ch : '.';
+}
+
 static int init(acpu_t *a) {
 	assert(a);
 	if (a->initialized)
@@ -263,17 +268,23 @@ static int init(acpu_t *a) {
 		a->sp = VSTART;
 	if (!a->rp)
 		a->rp = RSTART;
-	/*memset(a->m, ' ', ACPU_LENGTH - DEFS);
-	memset(&a->m[DEFS], '0', ACPU_LENGTH - DEFS);*/
+	for (size_t i = 0; i < (ACPU_LENGTH - DEFS); i++)
+		if (a->m[i] == '\0')
+			a->m[i] = ' ';
+	for (size_t i = DEFS; i < ACPU_LENGTH; i++)
+		a->m[i] = '0';
 	a->initialized = 1;
 	return 0;
 }
 
-/* TODO: Make short program to assembly, hexdump, disassembly to memory as a
- * simple bootloader.
- * TODO: Documentation
- * TODO: Test suite of programs, make a Forth interpreter...
- * TODO: Bounds checking */
+/* Possible improvements; more documentation, timer, sleep, random numbers,
+ * test programs (bootloader, a Forth interpreter written in this ASCII
+ * language, hexdump, utilities, program monitor, command line interpreter,
+ * rewrite complex instructions in terms of simpler ones and execute that), 
+ * "if...else...then" statements (perhaps using '[' and ']'), a comment
+ * instruction, string handling instructions, better bounds checking and 
+ * more tests, turn this program into a C library, debugging and tracing,
+ * run for X cycles, non-blocking input/output options, and more! */
 static int acpu(acpu_t *a) {
 	assert(a);
 	w pc = a->pc, tos = a->tos;
@@ -285,6 +296,13 @@ static int acpu(acpu_t *a) {
 		const int ch = a->prog ? fgetc(a->prog) : m[B(pc++)];
 		if (ch < 0)
 			break;
+		if (a->debug) {
+			if (fprintf(a->debug, "%04X:%02X/%c\n", a->prog ? -1 : pc - 1, ch, graphic(ch)) < 0) {
+				a->error = E_IO;
+				goto halt;
+			}
+		}
+
 		switch (ch) {
 		case '$': push(a, tos); tos = 0; break;
 		case '0': case '1': case '2': case '3': 
@@ -316,10 +334,10 @@ static int acpu(acpu_t *a) {
 		case '@': tos = loadw(a, &m[B(tos)]); break;
 		case '!': storew(a, &m[B(tos)], pop(a)); tos = pop(a); break;
 		case 'K': tos = a->m[B(tos)]; break;
-		case 'k': a->m[B(tos)] = pop(a); break;
-		case '`': push(a, tos); tos = m[B(pc++)]; break;
+		case 'k': a->m[B(tos)] = pop(a); tos = pop(a); break;
 		case 'y': tos = loadb(a, &m[tos]); break;
 		case 'Y': storeb(a, &m[B(tos)], pop(a)); tos = pop(a); break;
+		case '`': push(a, tos); tos = m[B(pc++)]; break;
 
 		case 's': push(a, tos); break; /* dup */
 		case 'S': tos = pop(a); break; /* drop */
@@ -333,16 +351,16 @@ static int acpu(acpu_t *a) {
 		case 'a': push(a, tos); tos = rpeek(a); break;
 
 		/* An `if...else...` construction would be helpful, as would
-		 * a loop that executed for `x` cycles. */
+		 * a loop that executed for `x` cycles. Relative jumps could
+		 * also be helpful in hand assembling things. */
 		case 'g': rpush(a, pc + WHSIZE); pc = loadw(a, &m[B(pc)]); break;
 		case 'G': rpush(a, pc); pc = tos; tos = pop(a); break; /* call */
-		case 'x': pc = rpop(a); break; /* return */
 		case 'j': pc = loadw(a, &m[B(pc)]); break; /* jump */
 		case 'J': pc = tos; tos = pop(a); break; /* jump */
-		case 'z': if (!tos) { pc = loadw(a, &m[B(pc)]); } else { pc += WHSIZE; } break; /* jump on zero */
-		case 'Z': if (tos) { pc = loadw(a, &m[B(pc)]); } else { pc += WHSIZE; } break; /* jump on non-zero */
+		case 'z': if (!tos) { pc = loadw(a, &m[B(pc)]); } else { pc += WHSIZE; } tos = pop(a); break; /* jump on zero */
+		case 'Z': if (tos) { pc = loadw(a, &m[B(pc)]); } else { pc += WHSIZE; } tos = pop(a); break; /* jump on non-zero */
 
-		case ';': pc = rpop(a); break; /* end define */
+		case ';': pc = rpop(a); break; /* end define / return */
 		case '%': rpush(a, pc + 1); pc = loadw(a, a->defs + (m[B(pc)] * WHSIZE)); break; /* call definition */
 		case '\'': push(a, tos); tos = loadw(a, a->defs + (m[B(pc)] * WHSIZE)); pc++; break;
 
@@ -353,7 +371,9 @@ static int acpu(acpu_t *a) {
 
 		case 'I': push(a, tos); tos = a->io.get ? io_get(&a->io) : -1; break; /* input */
 		case 'O': tos = a->io.put ? io_put(tos & 255, &a->io) : -1; break; /* output */
+		case 'o': if (a->io.put) { (void)io_put(tos & 255, &a->io); } tos = pop(a); break;
 		case '\0': case 'q': goto halt;
+		/* Unused but potentially useful: ,[]" and some alpha chars */
 		default: /* nop */ break;
 
 		/* Complex commands; (more) difficult to implement in hardware, 
@@ -424,13 +444,10 @@ static int acpu_tests(void) {
 	} test_t;
 
 	/* TODO: Test all these:
-	'6', '7', '8', '9', 
-	'E', '<', '>', 'u', 'U', '^',
-	'/', '*', '-', 'l', 'L', '~', '@', '!',
-	'K', 'k', '`', 'y', 'Y', 's', 'S', 'd', 'r', 'R', 'v', 'V',
-	'p', 'P', 'a', 'g', 'G', 'x', 'j', 'J', 'z', 'Z', ';', '%',
-	'\'', '(', ')', '{', '}', */
-	test_t tests[] = {
+	'<', '>', 'u', 'U', '^', '/', '*', '-', 'l', 'L',
+	'K', 'k', 'y', 'Y', 's', 'd', 'r', 'R', 'v', 'V',
+	'p', 'P', 'a', 'g', 'G', 'z', 'Z', */
+	test_t tests[] = { /* '(' and ')' are infinite loops so cannot be tested... */
 		{ 0, "", "", "", },
 		{ 0, "$1", "", "", },
 		{ 0, "$12345", "", "", },
@@ -449,6 +466,19 @@ static int acpu_tests(void) {
 		{ 0, "IOIO", "XY", "XY", },
 		{ 0, "IOqIO", "X", "XY", },
 		{ 0, "IOIOIIOSO", "ABDC", "ABCDEF", },
+		{ 0, ":A $3 $4 + . ;%A%A", "00070007", "" },
+		{ 0, "$6789.:A $2 $3 + ;%A%A+$A=.", "6789FFFF", "" },
+		{ 0, "$E123$2000!$2$2+.$2000@.", "0004E123", "" },
+		{ 0, "$F05A~", "", "", },
+		{ 0, "$F05A~.", "0FA5", "", },
+		{ 0, "`Ho`io`!o", "Hi!", "", },
+		{ 0, "`Ao`Bo", "AB", "", },
+		{ 0, "j0008`Ao`Bo", "B", "", },
+		{ 0, "$6J`Ao`Bo", "B", "", },
+		{ 0, " $7J`Ao`Bo", "B", "", },
+		{ 0, "$1$2..", "00020001", "", },
+		{ 0, "$1$2d..", "00010002", "", },
+		{ 0, "$1z0000", "", "", },
 	};
 
 	for (size_t i = 0; i < NELEMS(tests); i++) {
@@ -486,6 +516,7 @@ are run at startup. For a more detailed help - use the source.\n\n";
 int main(int argc, char **argv) {
 	static acpu_t a = { .pc = 0, };
 	a.io = (io_t){ .in = stdin, .out = stdout, .put = file_put, .get = file_get, };
+	a.debug = getenv("DEBUG") ? stderr : NULL;
 	/*a.prog = stdin;*/
 	if (argc < 2) {
 		(void)help(stderr, argv[0]);
